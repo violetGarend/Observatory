@@ -1,0 +1,52 @@
+痛点一：装了但忘了用 → 审计层
+现有方案：skill-graveyard 与 claude-skill-audit
+
+skill-graveyard 把每个 skill 名归入四个桶：Active（安装且成功调用）、Dead（窗口内零调用）、Missing（调用了但找不到 SKILL.md）、Hallucinated（调用报错，多为 Claude 把工具名/命令名当成 skill 名）。它的 prune 子命令只生成卸载计划，不自动执行；即使 --apply，也仅对用户级和 agents 级的符号链接执行 unlink（完全可逆），插件移除永远只打印命令。
+
+claude-skill-audit 更进一步，引入了一个被低估的指标：规则执行差距——你的 P0 规则写了“连续失败 3 次必须触发 systematic-debugging”，但 1388 次调用中它一次都没触发过。它的数据源是一个 PreToolUse hook 写入的 ~/.claude/skill-usage.log，没有 hook 就没有可信数据。
+
+可学习的思维： 审计工具的价值不在于“删除”，而在于把不可见的成本变成可排序的决策队列。skill-graveyard 的 cost 子命令估算元数据 token 占用，claude-skill-audit 的归档而非删除策略（_archived/ 观察 30 天）——两者都在做同一件事：降低你做出清理决策的摩擦，而不是替你做决定。
+
+痛点二：忘了名字 / 不知道用哪个 → 路由层
+现有方案：skill-matcher、which-skill、skill-router、find-skill
+
+skill-matcher 是一个元技能：会话开始时分析第一条消息，分类任务（文档、代码、设计等），推荐相关 skill 并解释为什么适合，确认后激活。它明确设计了“不推荐”的边界——“你好吗”不推荐，“修复 README 里的拼写错误”也不推荐，避免变成噪音源。
+
+which-skill 处理的是 “模糊请求” ：用户描述一个任务但说不出 skill 名时，它按交付物而非话题关键词路由（“老板要 Q3 launch 的更新” → 先确定产出是什么：PRD？排名列表？简报？），同时给出 best-fit + runner-up + 打破平局的依据，如果任务横跨 3 个以上 skill，则输出 workflow recipe 而非强行选一个。
+
+skill-router（SKRT）展示了一条纯工程路线：七层匹配策略从精确名称匹配（100 分）逐级降到模糊 Levenshtein（40 分）和 CJK bigram（75 分），300+ skills 索引和路由在 50ms 内完成，无 API key 时优雅降级到本地匹配。
+
+find-skill 的定位最特别：它不解决“忘了名字”，而是解决 “卡住了但不知道有没有工具能帮” 。触发方式是 /find-skill，流程强制先暂停确认“你究竟卡在哪”，再扫描本地 skill；本地不匹配才回退到 GitHub 高星仓库搜索，安装只在显式确认后发生。
+
+可学习的思维： 路由工具的分野不在“匹配算法”，而在 “何时触发、由谁确认、失败时退回哪里” 。skill-matcher 的选择是“会话启动时主动介入但严格过滤噪音”，which-skill 的选择是“把交付物作为路由锚点”，find-skill 的选择是“用户显式求助才启动，本地优先，外部兜底，安装绝不自动”。后者的设计规则值得直接抄：Step 1 的确认暂停永远不跳过，Step 6 的安装永远不自动——这两条规则把“推荐”和“替你决定”隔离开了。
+
+痛点三：外面有没有更适配的 → 发现层
+现有方案：cc-recommender、skills-radar、skill-of-skills
+
+cc-recommender 是一个 MCP Server，你在 Claude Code 里问 “What should I install?” ，它分析你的项目（语言、框架、依赖），然后从官方 marketplace、awesome-mcp-servers、awesome-claude-code 中推荐，并对结果做质量评分（官方状态、stars、新鲜度、来源）。
+
+skills-radar 解决的是发现层的上下文代价问题。它模仿 Anthropic 的 Tool Search 模式，把 skill 发现做成 lazy-loading：只暴露 search_skills 和 load_skill 两个工具，skill 描述默认不进入上下文，按需语义检索。在 117 个活跃 skill 的实测中，原生全量 listing 每轮注入 7,267 tokens（3.63% 窗口），name-only + 向量检索降到 887 tokens（0.44%），每轮省下约 6,380 tokens；同时它修复了“名称不含用户关键词就永不触发”的名称偏置漏召问题。
+
+skill-of-skills 走的是质量排名目录路线：1,400+ skills，按结构质量、声誉、实际采用度评分，而非原始 star 数，通过 MCP 提供“质量排名搜索、风险分析、需求脉冲”。
+
+可学习的思维： 发现层的核心矛盾是 “看见更多”与“不被更多淹没” 之间的张力。skills-radar 的解法最值得学习：把发现本身也做成一个可检索的工具调用，而不是把整个世界预加载进上下文。cc-recommender 的解法是以项目为上下文锚点，而非以关键词为锚点。两者共同指向一个设计原则：发现入口应该由“当前任务/当前项目”触发，而不是常驻。
+
+痛点四：为什么自动触发了 / 该触发的没触发 → 可观测性层
+现有方案：Claude Code 官方 Monitoring、cc-skill-trace
+
+Claude Code 官方 OTEL 日志已经暴露了关键字段：invocation_trigger——区分 "user-slash"（用户主动调用）、"claude-proactive"（Claude 自主触发）、"nested-skill"（嵌套调用）；以及 skill.source（bundled / userSettings / projectSettings / plugin）和 skill.kind（workflow）。这意味着“是谁触发的、从哪加载的”在官方层面已经可查，不需要自己逆向。
+
+cc-skill-trace 把这层数据做成了终端仪表盘：显示自动触发 vs 用户触发的比例（如 75% auto / 25% user）、每个 skill 的调用次数和触发来源拆解，以及最近调用的时间线（“14:34:55 commit auto — ‘测试通过后创建 PR’”）。它的安装方式是在 PreToolUse hook 中注册捕获，然后 /skill-trace 直接看板。
+
+可学习的思维： 可观测性工具的真正价值不在“计数”，而在区分“设计行为”和“意外行为” 。invocation_trigger 让你能回答：某个 skill 频繁触发，是因为它确实匹配得好（claude-proactive 合理），还是因为它的 description 写得过于宽泛、在“抢”触发？claude-skill-audit 的“规则执行差距”则是反面：规则写了但从未触发，说明 description 或触发条件与实际任务语言之间存在鸿沟。这两个信号合在一起，才构成对 skill 触发行为的完整诊断。
+
+四个痛点合在一起，暴露的是同一个设计原则
+四个层面的现有方案，底层思维可以收敛为一句话：不要试图让用户“记住更多”，而是让每一个工具都在正确的时机、以正确的粒度“自己出现”，同时让用户保留最终否决权。
+
+审计层让 Dead 技能自己暴露成本，而不是靠用户定期凭记忆巡检；
+
+路由层让 任务描述本身成为调用入口，名字退居幕后；
+
+发现层让 当前项目/当前卡点触发外部搜索，而不是把市场常驻在上下文里；
+
+可观测性层让 触发原因和触发缺口变得可见，而不是靠感觉猜测“为什么它又跳出来了”。

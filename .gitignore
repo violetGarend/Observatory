@@ -1,0 +1,5 @@
+node_modules/
+web/dist/
+*.log
+_snap.json
+.DS_Store
