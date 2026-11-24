@@ -124,35 +124,48 @@
       >
         <div class="mini-head">
           <span>用户指令时间线</span>
-          <span>{{ promptTicks.length }} 条 · 悬停查看指令与结果</span>
-        </div>
-
-        <div class="mini-rail">
-          <span class="mini-line"></span>
-          <button
-            v-for="tick in promptTicks"
-            :key="tick.seq"
-            type="button"
-            class="mini-mark"
-            :class="{ latest: tick.latest }"
-            :style="{ left: `${tick.left}%` }"
-            :aria-label="`${timeLabel(tick.ts)} ${tick.summary.slice(0, 40)}`"
-            @mouseenter="showTickTip(tick, $event)"
-            @focus="showTickTip(tick, $event)"
-            @blur="hideTickTip"
-            @click="jumpToTick(tick)"
-          ></button>
-        </div>
-
-        <div class="mini-axis">
-          <span
-            v-for="tick in axisTicks"
-            :key="tick.ts"
-            class="mini-axis-label"
-            :style="{ left: `${tick.left}%` }"
-          >
-            {{ tick.label }}
+          <span class="mini-head-right">
+            <span>{{ promptTicks.length }} 条 · 悬停查看指令与结果</span>
+            <template v-if="canPan">
+              <button type="button" class="mini-pan" title="查看更早的指令" aria-label="查看更早的指令" @click="panTimeline(-1)">‹</button>
+              <button type="button" class="mini-pan" title="查看更晚的指令" aria-label="查看更晚的指令" @click="panTimeline(1)">›</button>
+            </template>
           </span>
+        </div>
+
+        <div ref="miniScroller" class="mini-scroller" @scroll="hideTickTip">
+          <div
+            class="mini-track"
+            :style="{ minWidth: `${promptTicks.length * 34}px` }"
+          >
+            <div class="mini-rail">
+              <span class="mini-line"></span>
+              <button
+                v-for="tick in promptTicks"
+                :key="tick.seq"
+                type="button"
+                class="mini-mark"
+                :class="{ latest: tick.latest }"
+                :style="{ left: `${tick.left}%` }"
+                :aria-label="`${timeLabel(tick.ts)} ${tick.summary.slice(0, 40)}`"
+                @mouseenter="showTickTip(tick, $event)"
+                @focus="showTickTip(tick, $event)"
+                @blur="hideTickTip"
+                @click="jumpToTick(tick)"
+              ></button>
+            </div>
+
+            <div class="mini-axis">
+              <span
+                v-for="tick in axisTicks"
+                :key="tick.ts"
+                class="mini-axis-label"
+                :style="{ left: `${tick.left}%` }"
+              >
+                {{ tick.label }}
+              </span>
+            </div>
+          </div>
         </div>
 
         <div v-if="hoverTick" class="mini-tip" :style="{ left: `${tipLeft}px` }">
@@ -336,6 +349,8 @@ const filter = ref('all');
 const query = ref('');
 const view = ref('timeline');
 const miniTimeline = ref(null);
+const miniScroller = ref(null);
+const canPan = ref(false);
 const hoverTick = ref(null);
 const tipLeft = ref(0);
 const jumpKey = ref(null);
@@ -607,15 +622,45 @@ const axisTicks = computed(() => {
   });
 });
 
+watch(promptTicks, () => updateMiniScroll(true));
+
+function onMiniResize() {
+  updateMiniScroll(false);
+}
+
 function showTickTip(tick, event) {
   const rect = miniTimeline.value?.getBoundingClientRect();
   if (!rect) return;
-  const anchor =
-    event && typeof event.clientX === 'number' && event.clientX > 0
-      ? event.clientX - rect.left
-      : (rect.width * tick.left) / 100;
+  const target = event?.currentTarget?.getBoundingClientRect();
+  const anchor = target
+    ? target.left + target.width / 2 - rect.left
+    : (rect.width * tick.left) / 100;
   hoverTick.value = tick;
   tipLeft.value = Math.max(170, Math.min(rect.width - 170, anchor));
+}
+
+async function updateMiniScroll(scrollToEnd = false) {
+  await nextTick();
+  const el = miniScroller.value;
+  if (!el) {
+    // 首次加载时 v-if 可能刚挂载，稍后重试
+    setTimeout(() => updateMiniScroll(scrollToEnd), 100);
+    return;
+  }
+  canPan.value = el.scrollWidth > el.clientWidth + 1;
+  if (scrollToEnd) {
+    // 等轨道宽度和字体布局稳定后再靠右，否则首次会被浏览器夹回 0
+    el.scrollLeft = el.scrollWidth;
+    setTimeout(() => {
+      if (miniScroller.value) miniScroller.value.scrollLeft = miniScroller.value.scrollWidth;
+    }, 80);
+  }
+}
+
+function panTimeline(direction) {
+  const el = miniScroller.value;
+  if (!el) return;
+  el.scrollBy({ left: direction * el.clientWidth * 0.75, behavior: 'smooth' });
 }
 
 function hideTickTip() {
@@ -738,6 +783,7 @@ async function load({ more = false } = {}) {
 
     data.value = { ...json, returned: records.value.length };
     error.value = '';
+    if (!more) setTimeout(() => updateMiniScroll(true), 150);
   } catch (err) {
     if (err.name === 'AbortError' || mySeq !== seq || disposed) return;
     error.value = more ? '加载更早的记录失败' : err.message || '执行记录加载失败';
@@ -780,6 +826,7 @@ function onKeydown(event) {
 onMounted(() => {
   load();
   window.addEventListener('keydown', onKeydown);
+  window.addEventListener('resize', onMiniResize);
 });
 
 onUnmounted(() => {
@@ -787,6 +834,7 @@ onUnmounted(() => {
   clearTimeout(searchTimer);
   ctrl?.abort();
   window.removeEventListener('keydown', onKeydown);
+  window.removeEventListener('resize', onMiniResize);
 });
 
 function shortModel(model) {
@@ -1101,12 +1149,55 @@ function axisTimeLabel(ts, span) {
 
 .mini-head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
   gap: 10px;
   font-size: 9.5px;
   color: var(--text-3);
   margin-bottom: 3px;
+}
+
+.mini-head-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.mini-pan {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-content: center;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: rgba(148, 163, 184, 0.06);
+  color: var(--text-3);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.mini-pan:hover {
+  color: #5eead4;
+  border-color: rgba(94, 234, 212, 0.4);
+}
+
+.mini-scroller {
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.mini-scroller::-webkit-scrollbar {
+  display: none;
+}
+
+.mini-track {
+  position: relative;
+  width: 100%;
 }
 
 .mini-rail {
