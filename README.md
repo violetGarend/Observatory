@@ -248,10 +248,14 @@ JSONL 文件 ──增量读(字节 offset + 未成行 Buffer)──▶ 解析 �
 
 ## 版本管理
 
-仓库已初始化为 Git，默认分支 `main`。`.gitignore` 排除 `node_modules/`、`web/dist/`、`_snap.json`、`*.log` 与系统文件；当前未配置远程仓库，推送前需要先确认。
+仓库已初始化为 Git，默认分支 `main`，远程 `origin` 指向 GitHub 的 `violetGarend/Observatory`，本地 `main` 跟踪 `origin/main`。`.gitignore` 排除 `node_modules/`、`web/dist/`、`_snap.json`、`*.log` 与系统文件；推送前仍需确认。
 
 ## 技术栈
 
 - 后端：Node 24 · Express 4 · ws
 - 前端：Vue 3.5 · Vite 6 · ECharts 5
 - 无数据库，全部内存聚合（重启即重新回放）
+
+## License
+
+MIT © 2026 violetGarend。完整条款见 [LICENSE](LICENSE)。

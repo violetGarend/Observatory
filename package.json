@@ -2,6 +2,7 @@
   "name": "guanxingtai",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "description": "Claude Code 行为观测台：实时追踪 skill 触发、会话执行、MCP 与项目历史",
   "scripts": {
