@@ -95,14 +95,16 @@
           aria-label="搜索执行记录"
           @input="onSearchInput"
         />
-        <div class="view-switch" role="group" aria-label="展示方式">
-          <button type="button" :class="{ active: view === 'timeline' }" @click="view = 'timeline'">
-            时间线
-          </button>
-          <button type="button" :class="{ active: view === 'table' }" @click="view = 'table'">
-            表格
-          </button>
-        </div>
+        <button
+          type="button"
+          class="export"
+          :disabled="exporting || loading || !data"
+          title="导出当前筛选与搜索下的全部记录为 CSV"
+          @click="exportCsv"
+        >
+          {{ exporting ? '导出中…' : '导出 CSV' }}
+        </button>
+        <span v-if="exportError" class="warn export-error">{{ exportError }}</span>
 
         <span v-if="isFiltered" class="hint filter-hint">
           筛选结果 {{ data?.matched ?? 0 }} / {{ counts.total }}
@@ -181,7 +183,7 @@
       </div>
 
       <template v-else-if="records.length">
-        <div v-if="view === 'timeline'" class="timeline-wrap">
+        <div class="timeline-wrap">
           <section
             v-for="(group, gi) in timelineGroups"
             :key="group.key"
@@ -237,56 +239,6 @@
           </section>
         </div>
 
-        <div v-else class="table-wrap">
-          <table>
-            <caption>
-              会话的全部工具与 Skill 执行记录；默认按用户指令分组、组内按时间正序，筛选时按时间倒序。一次加载
-              {{ PAGE }} 条，可继续加载更早或全部。
-            </caption>
-            <thead>
-              <tr>
-                <th scope="col">时间</th>
-                <th scope="col">类型</th>
-                <th scope="col">名称</th>
-                <th scope="col">摘要</th>
-                <th scope="col">状态</th>
-                <th scope="col" class="num">耗时</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="r in displayRows"
-                :key="r.seq"
-                :class="{ failed: r.status === 'error', 'prompt-row': r.kind === 'prompt' }"
-              >
-                <td v-if="r.kind === 'prompt'" colspan="6" class="prompt-cell">
-                  <div class="prompt-line">
-                    <span class="p-badge">用户指令</span>
-                    <span class="p-time mono">{{ timeLabel(r.ts) }}</span>
-                    <span class="p-text" :title="r.summary">{{ r.summary }}</span>
-                  </div>
-                </td>
-
-                <template v-else>
-                  <td class="time mono">{{ timeLabel(r.ts) }}</td>
-                  <td class="kind-cell">
-                    <span class="kind" :class="r.kind">{{ kindLabel(r) }}</span>
-                    <span v-if="r.source === 'subagent'" class="src" :title="r.agent">子代理</span>
-                    <span v-if="r.source === 'history'" class="src">历史</span>
-                  </td>
-                  <td class="name">
-                    <code v-if="r.server" class="server">{{ r.server }} ·</code>
-                    <code>{{ r.name }}</code>
-                  </td>
-                  <td class="summary" :title="r.summary">{{ r.summary || '—' }}</td>
-                  <td><span class="rec-status" :class="r.status">{{ statusText(r) }}</span></td>
-                  <td class="num mono">{{ fmtDuration(r.durationMs) }}</td>
-                </template>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-
         <footer class="rec-foot">
           <span v-if="isFiltered">已显示 {{ records.length }} / {{ data?.matched ?? 0 }}（全量 {{ counts.total }}）</span>
           <span v-else>
@@ -329,6 +281,8 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { compact, duration, relative } from '../lib/format.js';
 
 const PAGE = 300;
+const EXPORT_LIMIT = 1000;
+const EXPORT_MAX_PAGES = 100;
 
 const FILTERS = [
   { key: 'all', label: '全部' },
@@ -356,7 +310,8 @@ const loadingAll = ref(false);
 const error = ref('');
 const filter = ref('all');
 const query = ref('');
-const view = ref('timeline');
+const exporting = ref(false);
+const exportError = ref('');
 const miniTimeline = ref(null);
 const miniScroller = ref(null);
 const canPan = ref(false);
@@ -365,6 +320,7 @@ const tipLeft = ref(0);
 const jumpKey = ref(null);
 
 let ctrl = null;
+let exportCtrl = null;
 let seq = 0;
 let disposed = false;
 let loadAllToken = 0;
@@ -394,34 +350,6 @@ const statusCounts = computed(
 const totalForFooter = computed(() =>
   isFiltered.value ? data.value?.matched ?? 0 : counts.value.total
 );
-
-/** 默认把用户指令当作分隔符，让每条工具调用都落在具体任务下面 */
-const displayRows = computed(() => {
-  if (isFiltered.value) return records.value;
-
-  const hasPrompt = records.value.some((r) => r.kind === 'prompt');
-  if (!hasPrompt) return records.value;
-
-  // records 是新→旧；每遇到一条用户指令，前面的动作就属于该回合
-  const groups = [];
-  let bucket = [];
-  for (const record of records.value) {
-    if (record.kind === 'prompt') {
-      groups.push({ prompt: record, tools: bucket });
-      bucket = [];
-    } else {
-      bucket.push(record);
-    }
-  }
-  if (bucket.length) groups.push({ prompt: null, tools: bucket });
-
-  const rows = [];
-  for (const group of groups) {
-    if (group.prompt) rows.push(group.prompt);
-    rows.push(...group.tools.slice().reverse()); // 回合内按时间正序
-  }
-  return rows;
-});
 
 /** 粗略视觉宽度：CJK 记 2，其余记 1，用来判断指令是否需要独占一行 */
 function promptWeight(text) {
@@ -703,7 +631,6 @@ async function jumpToTick(tick) {
   }
   if (!isLoaded()) return;
 
-  view.value = 'timeline';
   await nextTick();
   const key = `prompt-${tick.seq}`;
   const el = document.querySelector(`[data-turn-key="${key}"]`);
@@ -759,6 +686,19 @@ async function readError(res) {
   }
 }
 
+/** 列表接口的筛选参数；导出时传入捕获的 kind/query，避免翻页途中被界面改动 */
+function applyFilterParams(params, kind = filter.value, q = query.value.trim()) {
+  if (['tool', 'skill', 'mcp', 'prompt'].includes(kind)) {
+    params.set('kind', kind);
+  } else if (kind === 'error') {
+    params.set('status', 'error');
+  } else if (kind === 'subagent') {
+    params.set('source', 'subagent');
+  }
+  if (q) params.set('q', q);
+  return params;
+}
+
 async function load({ more = false } = {}) {
   if (disposed) return;
   if (more && !data.value?.hasMore) return;
@@ -785,15 +725,7 @@ async function load({ more = false } = {}) {
     if (more && data.value?.nextBefore != null) {
       params.set('before', String(data.value.nextBefore));
     }
-    if (['tool', 'skill', 'mcp', 'prompt'].includes(filter.value)) {
-      params.set('kind', filter.value);
-    } else if (filter.value === 'error') {
-      params.set('status', 'error');
-    } else if (filter.value === 'subagent') {
-      params.set('source', 'subagent');
-    }
-    const q = query.value.trim();
-    if (q) params.set('q', q);
+    applyFilterParams(params);
     const res = await fetch(
       `/api/sessions/${encodeURIComponent(props.sessionId)}/records?${params}`,
       { signal: ctrl.signal }
@@ -842,21 +774,137 @@ async function loadAll() {
   }
 }
 
+function csvCell(value) {
+  const text = String(value ?? '');
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function csvTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function exportKind(record) {
+  if (record.kind === 'prompt') return '用户指令';
+  if (record.kind === 'skill') return record.tool === 'SlashCommand' ? 'Skill（历史命令）' : 'Skill';
+  if (record.kind === 'mcp') return 'MCP';
+  return '工具';
+}
+
+function exportSource(record) {
+  if (record.source === 'subagent') return '子代理';
+  if (record.source === 'history') return '历史命令';
+  return '主转录';
+}
+
+function exportFilename(kind, q) {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+  const tag = kind === 'all' ? (q ? '-搜索' : '') : `-${kind}`;
+  return `执行记录-${props.sessionId.slice(0, 8)}${tag}-${stamp}.csv`;
+}
+
+/** 按当前筛选/搜索导出全部匹配记录，不受已加载分页限制 */
+async function exportCsv() {
+  if (disposed || exporting.value || loading.value) return;
+
+  const kind = filter.value;
+  const q = query.value.trim();
+  const ctrl = new AbortController();
+  exportCtrl = ctrl;
+  exporting.value = true;
+  exportError.value = '';
+
+  try {
+    const rows = [];
+    let before = null;
+
+    for (let page = 0; ; page++) {
+      if (page >= EXPORT_MAX_PAGES) {
+        throw new Error(`记录超过 ${EXPORT_LIMIT * EXPORT_MAX_PAGES} 条，请先筛选后再导出`);
+      }
+
+      const params = applyFilterParams(
+        new URLSearchParams({ limit: String(EXPORT_LIMIT) }),
+        kind,
+        q
+      );
+      if (before != null) params.set('before', String(before));
+      const res = await fetch(
+        `/api/sessions/${encodeURIComponent(props.sessionId)}/records?${params}`,
+        { signal: ctrl.signal }
+      );
+      if (!res.ok) throw new Error(await readError(res));
+      const json = await res.json();
+      rows.push(...(json.records || []));
+      if (!json.hasMore) break;
+      before = json.nextBefore;
+      if (before == null) break;
+    }
+
+    if (!rows.length) throw new Error('当前筛选下没有可导出的记录');
+    rows.sort((a, b) => (a.ts || 0) - (b.ts || 0) || a.seq - b.seq);
+
+    const header = ['时间', '类型', '名称', '服务', '摘要', '结果', '状态', '耗时(ms)', '来源', '代理'];
+    const lines = [header];
+    for (const record of rows) {
+      lines.push([
+        csvTime(record.ts),
+        exportKind(record),
+        record.name || '',
+        record.server || '',
+        record.summary || '',
+        record.kind === 'prompt' ? record.resultText || '' : record.result || '',
+        record.kind === 'prompt' ? '' : statusText(record),
+        record.durationMs == null ? '' : record.durationMs,
+        exportSource(record),
+        record.agent && record.agent !== 'main' ? record.agent : '',
+      ]);
+    }
+
+    const csv = `${String.fromCharCode(0xfeff)}${lines.map((cols) => cols.map(csvCell).join(',')).join('\r\n')}\r\n`;
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = exportFilename(kind, q);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    exportError.value = `导出失败：${err.message || err}`;
+  } finally {
+    if (exportCtrl === ctrl) exportCtrl = null;
+    exporting.value = false;
+  }
+}
+
 function setFilter(key) {
   if (filter.value === key) return;
   clearTimeout(searchTimer);
+  exportError.value = '';
   filter.value = key;
   load();
 }
 
 function onSearchInput() {
   clearTimeout(searchTimer);
+  exportError.value = '';
   searchTimer = setTimeout(() => load(), 300);
 }
 
 watch(
   () => props.sessionId,
   () => {
+    exportCtrl?.abort();
+    exportCtrl = null;
+    exporting.value = false;
+    exportError.value = '';
     records.value = [];
     data.value = null;
     error.value = '';
@@ -880,6 +928,7 @@ onUnmounted(() => {
   disposed = true;
   clearTimeout(searchTimer);
   ctrl?.abort();
+  exportCtrl?.abort();
   window.removeEventListener('keydown', onKeydown);
   window.removeEventListener('resize', onMiniResize);
 });
@@ -1156,34 +1205,6 @@ function axisTimeLabel(ts, span) {
   margin-left: auto;
   font-size: 10px;
   color: var(--text-3);
-}
-
-.view-switch {
-  display: flex;
-  gap: 2px;
-  padding: 2px;
-  border-radius: 9px;
-  background: rgba(148, 163, 184, 0.07);
-}
-
-.view-switch button {
-  appearance: none;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--text-3);
-  font: inherit;
-  font-size: 11px;
-  line-height: 1;
-  padding: 4px 9px;
-  min-height: 25px;
-  border-radius: 7px;
-  cursor: pointer;
-}
-
-.view-switch button.active {
-  color: var(--text-1);
-  background: rgba(94, 234, 212, 0.14);
-  border-color: rgba(94, 234, 212, 0.45);
 }
 
 .mini-timeline {
@@ -1781,9 +1802,14 @@ function axisTimeLabel(ts, span) {
   margin-left: auto;
 }
 
+.export-error {
+  font-size: 10.5px;
+}
+
 .refresh,
 .more,
-.retry {
+.retry,
+.export {
   appearance: none;
   border: 1px solid var(--line);
   background: rgba(148, 163, 184, 0.06);
@@ -1802,210 +1828,22 @@ function axisTimeLabel(ts, span) {
 
 .refresh:hover,
 .more:hover,
-.retry:hover {
+.retry:hover,
+.export:hover {
   color: var(--text-1);
   border-color: rgba(94, 234, 212, 0.35);
 }
 
 .refresh:disabled,
-.more:disabled {
+.more:disabled,
+.export:disabled {
   opacity: 0.45;
   cursor: default;
-}
-
-.table-wrap {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-}
-
-table {
-  width: 100%;
-  border-collapse: collapse;
-  table-layout: fixed;
-  font-size: 11.5px;
-}
-
-th:nth-child(1) { width: 112px; }
-th:nth-child(2) { width: 104px; }
-th:nth-child(3) { width: 30%; }
-th:nth-child(5) { width: 82px; }
-th:nth-child(6) { width: 82px; }
-
-caption {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-  white-space: nowrap;
-  border: 0;
-}
-
-thead th {
-  position: sticky;
-  top: 0;
-  z-index: 1;
-  background: #0d121b;
-  text-align: left;
-  font-weight: 600;
-  color: var(--text-3);
-  font-size: 10.5px;
-  letter-spacing: 0.03em;
-  padding: 7px 12px;
-  border-bottom: 1px solid var(--line);
-  white-space: nowrap;
-}
-
-th.num,
-td.num {
-  text-align: right;
-}
-
-tbody td {
-  padding: 6px 12px;
-  border-bottom: 1px solid rgba(148, 163, 184, 0.06);
-  color: var(--text-2);
-  vertical-align: middle;
-}
-
-tbody tr:nth-child(even):not(.failed):not(.prompt-row) {
-  background: rgba(148, 163, 184, 0.022);
-}
-
-tbody tr:hover {
-  background: rgba(148, 163, 184, 0.04);
-}
-
-tbody tr.failed {
-  background: rgba(248, 113, 113, 0.045);
-}
-
-tbody tr.prompt-row td {
-  padding: 8px 12px;
-  background: rgba(94, 234, 212, 0.06);
-  border-top: 1px solid rgba(94, 234, 212, 0.22);
-  border-bottom: 1px solid rgba(94, 234, 212, 0.22);
-}
-
-.prompt-line {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  min-width: 0;
-}
-
-.p-badge {
-  flex: 0 0 auto;
-  font-size: 9.5px;
-  color: #6ee7b7;
-  border: 1px solid rgba(52, 211, 153, 0.35);
-  border-radius: 99px;
-  padding: 1px 7px;
-}
-
-.p-time {
-  flex: 0 0 auto;
-  font-size: 10px;
-  color: var(--text-3);
-}
-
-.p-text {
-  min-width: 0;
-  font-size: 12px;
-  line-height: 1.5;
-  color: var(--text-1);
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
 }
 
 .mono {
   font-family: ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
   font-variant-numeric: tabular-nums;
-}
-
-.time {
-  color: var(--text-3);
-  white-space: nowrap;
-}
-
-.kind-cell {
-  white-space: nowrap;
-}
-
-.kind {
-  display: inline-block;
-  font-size: 9.5px;
-  line-height: 1.5;
-  padding: 1px 7px;
-  border-radius: 99px;
-  border: 1px solid var(--line);
-  color: var(--text-3);
-}
-
-.kind.skill {
-  color: #6ee7b7;
-  border-color: rgba(52, 211, 153, 0.35);
-  background: rgba(52, 211, 153, 0.07);
-}
-
-.kind.mcp {
-  color: #c4b5fd;
-  border-color: rgba(167, 139, 250, 0.35);
-  background: rgba(167, 139, 250, 0.07);
-}
-
-.src {
-  margin-left: 4px;
-  font-size: 9px;
-  color: var(--text-3);
-  border: 1px dashed rgba(148, 163, 184, 0.3);
-  border-radius: 4px;
-  padding: 0 4px;
-}
-
-.name {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.name code {
-  font-family: ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
-  color: var(--text-1);
-}
-
-.name .server {
-  color: var(--text-3);
-  margin-right: 4px;
-}
-
-.summary {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-2);
-}
-
-.rec-status {
-  font-size: 10px;
-  white-space: nowrap;
-}
-
-.rec-status.ok {
-  color: #6ee7b7;
-}
-
-.rec-status.error {
-  color: #fca5a5;
-}
-
-.rec-status.pending {
-  color: #fbbf24;
 }
 
 .rec-foot {
@@ -2048,15 +1886,6 @@ tbody tr.prompt-row td {
 
   .records-panel {
     height: auto;
-  }
-
-  .table-wrap {
-    max-height: 60vh;
-    overflow: auto;
-  }
-
-  table {
-    min-width: 820px;
   }
 }
 </style>
