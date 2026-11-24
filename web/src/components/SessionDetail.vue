@@ -561,14 +561,22 @@ const promptTicks = computed(() => {
   const gap = 0.8;
   let previous = -Infinity;
 
-  const ticks = prompts.map((prompt, index) => {
+  const raw = prompts.map((prompt) => {
     const base =
       prompts.length === 1 ? 50 : Math.min(98, Math.max(2, ((prompt.ts - first) / span) * 100));
-    // 同一时段的指令会挤在一个点；给相邻点保留最小间距，避免完全重叠
-    let left = Math.max(base, previous + gap);
-    left = Math.min(98, Math.max(2, left));
+    // 同一时段的指令会挤在一个点；先给相邻点保留最小间距
+    const left = Math.max(base, previous + gap);
     previous = left;
+    return { prompt, left };
+  });
 
+  // 如果密集指令把尾部顶出 98%，整体压回 2–98，避免挤在边界重叠
+  const min = raw[0].left;
+  const max = raw[raw.length - 1].left;
+  const scale = max - min > 96 ? 96 / (max - min) : 1;
+
+  return raw.map(({ prompt, left: rawLeft }, index) => {
+    const left = 2 + (rawLeft - min) * scale;
     const result = resultExcerpt(prompt.resultText || '', 260);
     return {
       ...prompt,
@@ -577,8 +585,6 @@ const promptTicks = computed(() => {
       result: result || '结果尚未生成',
     };
   });
-
-  return ticks;
 });
 
 const axisTicks = computed(() => {
@@ -1121,7 +1127,7 @@ function axisTimeLabel(ts, span) {
 .mini-mark {
   position: absolute;
   top: 2px;
-  width: 4px;
+  width: clamp(2px, 0.35vw, 4px);
   height: 15px;
   padding: 0;
   border: 0;
@@ -1335,10 +1341,6 @@ function axisTimeLabel(ts, span) {
   padding: 4px 8px;
   border-radius: 6px;
   font-size: 11px;
-}
-
-.action-row:nth-child(even):not(.failed) {
-  background: rgba(148, 163, 184, 0.022);
 }
 
 .action-row:hover {
