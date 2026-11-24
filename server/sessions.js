@@ -476,5 +476,14 @@ export function sliceRecords(
     hasMore,
     nextBefore,
     records: page,
+    // 独立于分页与筛选：给会话顶部的指令时间轴提供全量指令与结果
+    turns: data.records
+      .filter((record) => record.kind === 'prompt')
+      .map((record) => ({
+        seq: record.seq,
+        ts: record.ts,
+        summary: record.summary,
+        resultText: record.resultText || '',
+      })),
   };
 }

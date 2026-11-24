@@ -116,6 +116,58 @@
         </span>
       </div>
 
+      <div
+        v-if="!isFiltered && !loading && promptTicks.length"
+        ref="miniTimeline"
+        class="mini-timeline"
+        @mouseleave="hideTickTip"
+      >
+        <div class="mini-head">
+          <span>用户指令时间线</span>
+          <span>{{ promptTicks.length }} 条 · 悬停查看指令与结果</span>
+        </div>
+
+        <div class="mini-rail">
+          <span class="mini-line"></span>
+          <button
+            v-for="tick in promptTicks"
+            :key="tick.seq"
+            type="button"
+            class="mini-mark"
+            :class="{ latest: tick.latest }"
+            :style="{ left: `${tick.left}%` }"
+            :aria-label="`${timeLabel(tick.ts)} ${tick.summary.slice(0, 40)}`"
+            @mouseenter="showTickTip(tick, $event)"
+            @focus="showTickTip(tick, $event)"
+            @blur="hideTickTip"
+            @click="jumpToTick(tick)"
+          ></button>
+        </div>
+
+        <div class="mini-axis">
+          <span
+            v-for="tick in axisTicks"
+            :key="tick.ts"
+            class="mini-axis-label"
+            :style="{ left: `${tick.left}%` }"
+          >
+            {{ tick.label }}
+          </span>
+        </div>
+
+        <div v-if="hoverTick" class="mini-tip" :style="{ left: `${tipLeft}px` }">
+          <div class="tip-time mono">{{ timeLabel(hoverTick.ts) }}</div>
+          <div class="tip-section">
+            <span class="tip-label">指令</span>
+            <p>{{ hoverTick.summary }}</p>
+          </div>
+          <div class="tip-section">
+            <span class="tip-label">结果</span>
+            <p>{{ hoverTick.result }}</p>
+          </div>
+        </div>
+      </div>
+
       <div v-if="loading" class="state">正在解析会话转录…</div>
       <div v-else-if="error && !records.length" class="state">
         {{ error }}
@@ -128,9 +180,14 @@
             v-for="(group, gi) in timelineGroups"
             :key="group.key"
             class="turn"
-            :class="{ latest: gi === 0 && !isFiltered }"
+            :class="{ latest: gi === 0 && !isFiltered, target: jumpKey === group.key }"
+            :data-turn-key="group.key"
           >
-            <div v-if="group.prompt" class="turn-prompt">
+            <div
+              v-if="group.prompt"
+              class="turn-prompt"
+              :class="{ long: promptWeight(group.prompt.summary) > 120 }"
+            >
               <span class="t-dot"></span>
               <span class="t-time mono">{{ timeLabel(group.prompt.ts) }}</span>
               <span class="t-badge">用户指令</span>
@@ -247,7 +304,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { compact, duration, relative } from '../lib/format.js';
 
 const PAGE = 300;
@@ -278,6 +335,10 @@ const error = ref('');
 const filter = ref('all');
 const query = ref('');
 const view = ref('timeline');
+const miniTimeline = ref(null);
+const hoverTick = ref(null);
+const tipLeft = ref(0);
+const jumpKey = ref(null);
 
 let ctrl = null;
 let seq = 0;
@@ -332,6 +393,15 @@ const displayRows = computed(() => {
   }
   return rows;
 });
+
+/** 粗略视觉宽度：CJK 记 2，其余记 1，用来判断指令是否需要独占一行 */
+function promptWeight(text) {
+  let weight = 0;
+  for (const ch of String(text || '')) {
+    weight += /[　-鿿＀-￯]/.test(ch) ? 2 : 1;
+  }
+  return weight;
+}
 
 function baseName(filePath) {
   const parts = String(filePath || '').replace(/\\/g, '/').split('/');
@@ -477,6 +547,101 @@ const latestTurn = computed(() => {
   if (isFiltered.value) return null;
   return timelineGroups.value.find((group) => group.prompt) || null;
 });
+
+const promptTicks = computed(() => {
+  const source =
+    data.value?.turns ||
+    records.value.filter((record) => record.kind === 'prompt').slice().reverse();
+  const prompts = source.filter((prompt) => prompt.ts).slice().sort((a, b) => a.ts - b.ts);
+  if (!prompts.length) return [];
+
+  const first = prompts[0].ts;
+  const last = prompts[prompts.length - 1].ts;
+  const span = Math.max(1, last - first);
+  const gap = 0.8;
+  let previous = -Infinity;
+
+  const ticks = prompts.map((prompt, index) => {
+    const base =
+      prompts.length === 1 ? 50 : Math.min(98, Math.max(2, ((prompt.ts - first) / span) * 100));
+    // 同一时段的指令会挤在一个点；给相邻点保留最小间距，避免完全重叠
+    let left = Math.max(base, previous + gap);
+    left = Math.min(98, Math.max(2, left));
+    previous = left;
+
+    const result = resultExcerpt(prompt.resultText || '', 260);
+    return {
+      ...prompt,
+      left,
+      latest: index === prompts.length - 1,
+      result: result || '结果尚未生成',
+    };
+  });
+
+  return ticks;
+});
+
+const axisTicks = computed(() => {
+  const ticks = promptTicks.value;
+  if (!ticks.length) return [];
+
+  const first = ticks[0];
+  const last = ticks[ticks.length - 1];
+  const span = Math.max(1, last.ts - first.ts);
+  const count = ticks.length === 1 ? 1 : 5;
+
+  return Array.from({ length: count }, (_, index) => {
+    const ratio = count === 1 ? 0.5 : index / (count - 1);
+    const ts = first.ts + span * ratio;
+    return {
+      ts,
+      left: count === 1 ? 50 : first.left + (last.left - first.left) * ratio,
+      label: axisTimeLabel(ts, span),
+    };
+  });
+});
+
+function showTickTip(tick, event) {
+  const rect = miniTimeline.value?.getBoundingClientRect();
+  if (!rect) return;
+  const anchor =
+    event && typeof event.clientX === 'number' && event.clientX > 0
+      ? event.clientX - rect.left
+      : (rect.width * tick.left) / 100;
+  hoverTick.value = tick;
+  tipLeft.value = Math.max(170, Math.min(rect.width - 170, anchor));
+}
+
+function hideTickTip() {
+  hoverTick.value = null;
+}
+
+async function jumpToTick(tick) {
+  const isLoaded = () =>
+    records.value.some((record) => record.kind === 'prompt' && record.seq === tick.seq);
+
+  // 指令来自全量 turns；若还没加载到对应分页，先加载更早的记录
+  let guard = 0;
+  while (!isLoaded() && data.value?.hasMore && guard < 30) {
+    const before = records.value.length;
+    await load({ more: true });
+    guard++;
+    if (records.value.length === before) break;
+  }
+  if (!isLoaded()) return;
+
+  view.value = 'timeline';
+  await nextTick();
+  const key = `prompt-${tick.seq}`;
+  const el = document.querySelector(`[data-turn-key="${key}"]`);
+  if (!el) return;
+  jumpKey.value = key;
+  el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  hoverTick.value = null;
+  setTimeout(() => {
+    if (jumpKey.value === key) jumpKey.value = null;
+  }, 1800);
+}
 
 const title = computed(() => {
   const s = props.session;
@@ -660,6 +825,17 @@ function timeShort(ts) {
   const d = new Date(ts);
   const p = (n) => String(n).padStart(2, '0');
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function axisTimeLabel(ts, span) {
+  const d = new Date(ts);
+  const p = (n) => String(n).padStart(2, '0');
+  const date = `${p(d.getMonth() + 1)}/${p(d.getDate())}`;
+  // 一周以内带小时，长跨度只标日期，避免轴标签挤在一起
+  if (span <= 7 * 24 * 60 * 60 * 1000) {
+    return `${date} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  }
+  return date;
 }
 </script>
 
@@ -852,9 +1028,9 @@ function timeShort(ts) {
   align-items: baseline;
   gap: 10px;
   padding: 9px 12px;
-  border: 1px solid rgba(94, 234, 212, 0.24);
+  border: 1px solid rgba(94, 234, 212, 0.3);
   border-radius: 9px;
-  background: rgba(94, 234, 212, 0.045);
+  background: rgba(94, 234, 212, 0.065);
 }
 
 .lr-label {
@@ -909,6 +1085,138 @@ function timeShort(ts) {
   border-color: rgba(94, 234, 212, 0.45);
 }
 
+.mini-timeline {
+  position: relative;
+  flex: 0 0 auto;
+  padding: 10px 22px 8px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(148, 163, 184, 0.02);
+}
+
+.mini-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 9.5px;
+  color: var(--text-3);
+  margin-bottom: 3px;
+}
+
+.mini-rail {
+  position: relative;
+  height: 19px;
+  margin: 0 8px;
+}
+
+.mini-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 9px;
+  height: 1px;
+  background: rgba(148, 163, 184, 0.28);
+}
+
+.mini-mark {
+  position: absolute;
+  top: 2px;
+  width: 4px;
+  height: 15px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: rgba(94, 234, 212, 0.42);
+  transform: translateX(-50%);
+  cursor: pointer;
+  z-index: 2;
+}
+
+.mini-mark::before {
+  content: '';
+  position: absolute;
+  inset: -4px -3px;
+}
+
+.mini-mark:hover,
+.mini-mark:focus-visible {
+  background: #5eead4;
+  box-shadow: 0 0 8px rgba(94, 234, 212, 0.7);
+  outline: none;
+}
+
+.mini-mark.latest {
+  top: 0;
+  height: 19px;
+  background: #5eead4;
+}
+
+.mini-axis {
+  position: relative;
+  height: 12px;
+  margin: 2px 8px 0;
+}
+
+.mini-axis-label {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Code', monospace;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--text-3);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.mini-tip {
+  position: absolute;
+  top: calc(100% - 4px);
+  left: 0;
+  transform: translateX(-50%);
+  z-index: 20;
+  width: 320px;
+  max-width: calc(100vw - 40px);
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(10, 14, 22, 0.98);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  pointer-events: none;
+}
+
+.tip-time {
+  font-size: 9.5px;
+  color: var(--text-3);
+}
+
+.tip-section {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tip-label {
+  font-size: 9px;
+  font-weight: 600;
+  color: #5eead4;
+}
+
+.tip-section p {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-1);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: pre-wrap;
+}
+
 .timeline-wrap {
   flex: 1;
   min-height: 0;
@@ -921,6 +1229,12 @@ function timeShort(ts) {
   margin: 0 0 18px 10px;
   padding-left: 20px;
   border-left: 1px solid rgba(148, 163, 184, 0.16);
+  scroll-margin-top: 12px;
+}
+
+.turn.target {
+  border-radius: 8px;
+  background: rgba(94, 234, 212, 0.045);
 }
 
 .turn:last-child {
@@ -933,7 +1247,30 @@ function timeShort(ts) {
   align-items: baseline;
   flex-wrap: wrap;
   gap: 8px;
-  padding: 0 0 8px;
+  padding: 6px 10px;
+  margin-bottom: 7px;
+  border: 1px solid rgba(94, 234, 212, 0.16);
+  border-radius: 7px;
+  background: rgba(94, 234, 212, 0.05);
+}
+
+.turn.latest .turn-prompt {
+  background: rgba(94, 234, 212, 0.075);
+  border-color: rgba(94, 234, 212, 0.28);
+}
+
+.turn-prompt.long {
+  align-items: flex-start;
+}
+
+.turn-prompt.long .t-text {
+  flex: 1 1 100%;
+  margin-top: 3px;
+}
+
+.turn-prompt.muted {
+  border-color: var(--line);
+  background: rgba(148, 163, 184, 0.045);
 }
 
 .t-dot {
@@ -971,7 +1308,9 @@ function timeShort(ts) {
 }
 
 .t-text {
-  flex: 1 1 100%;
+  /* 短指令与时间/徽标同行；空间不足或文本较长时在剩余宽度内换行，最多两行 */
+  flex: 1 1 320px;
+  min-width: 0;
   margin: 0;
   font-size: 12.5px;
   line-height: 1.5;
@@ -996,6 +1335,10 @@ function timeShort(ts) {
   padding: 4px 8px;
   border-radius: 6px;
   font-size: 11px;
+}
+
+.action-row:nth-child(even):not(.failed) {
+  background: rgba(148, 163, 184, 0.022);
 }
 
 .action-row:hover {
@@ -1099,15 +1442,15 @@ function timeShort(ts) {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 7px;
-  padding: 7px 10px;
-  border: 1px dashed rgba(148, 163, 184, 0.18);
+  padding: 8px 10px;
+  border: 1px solid rgba(94, 234, 212, 0.16);
   border-radius: 7px;
-  background: rgba(148, 163, 184, 0.035);
+  background: rgba(94, 234, 212, 0.05);
 }
 
 .turn.latest .turn-summary {
-  border-color: rgba(94, 234, 212, 0.28);
-  background: rgba(94, 234, 212, 0.035);
+  border-color: rgba(94, 234, 212, 0.3);
+  background: rgba(94, 234, 212, 0.075);
 }
 
 .ts-label {
@@ -1392,6 +1735,10 @@ tbody td {
   vertical-align: middle;
 }
 
+tbody tr:nth-child(even):not(.failed):not(.prompt-row) {
+  background: rgba(148, 163, 184, 0.022);
+}
+
 tbody tr:hover {
   background: rgba(148, 163, 184, 0.04);
 }
@@ -1402,9 +1749,9 @@ tbody tr.failed {
 
 tbody tr.prompt-row td {
   padding: 8px 12px;
-  background: rgba(94, 234, 212, 0.035);
-  border-top: 1px solid rgba(94, 234, 212, 0.14);
-  border-bottom: 1px solid rgba(94, 234, 212, 0.14);
+  background: rgba(94, 234, 212, 0.06);
+  border-top: 1px solid rgba(94, 234, 212, 0.22);
+  border-bottom: 1px solid rgba(94, 234, 212, 0.22);
 }
 
 .prompt-line {
