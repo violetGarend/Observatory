@@ -59,18 +59,11 @@
       </header>
 
       <div v-if="data" class="overview">
-        <div class="ratio">
-          <div class="ratio-bar" :title="`成功 ${statusCounts.ok} · 失败 ${statusCounts.error} · 未返回 ${statusCounts.pending}`">
-            <span class="ok" :style="{ flex: statusCounts.ok }"></span>
-            <span class="bad" :style="{ flex: statusCounts.error }"></span>
-            <span class="pending" :style="{ flex: statusCounts.pending }"></span>
-          </div>
-          <div class="ratio-text">
-            <span><i class="dot ok"></i>成功 {{ statusCounts.ok }}</span>
-            <span><i class="dot bad"></i>失败 {{ statusCounts.error }}</span>
-            <span><i class="dot pending"></i>未返回 {{ statusCounts.pending }}</span>
-            <span class="muted">共 {{ counts.executions }} 次执行</span>
-          </div>
+        <div class="ratio-text">
+          <span><i class="dot ok"></i>成功 {{ statusCounts.ok }}</span>
+          <span><i class="dot bad"></i>失败 {{ statusCounts.error }}</span>
+          <span><i class="dot pending"></i>未返回 {{ statusCounts.pending }}</span>
+          <span class="muted">共 {{ counts.executions }} 次执行</span>
         </div>
 
         <div class="top-tools">
@@ -199,12 +192,17 @@
             <div
               v-if="group.prompt"
               class="turn-prompt"
-              :class="{ long: promptWeight(group.prompt.summary) > 120 }"
+              :class="{ long: promptWeight(group.prompt.summary) > 120, timed: !!group.totalMs }"
             >
               <span class="t-dot"></span>
               <span class="t-time mono">{{ timeLabel(group.prompt.ts) }}</span>
               <span class="t-badge">用户指令</span>
               <p class="t-text" :title="group.prompt.summary">{{ group.prompt.summary }}</p>
+              <span
+                v-if="group.totalMs"
+                class="t-duration mono"
+                title="从用户指令到最后一次动作完成的总耗时"
+              >总耗时 {{ fmtDuration(group.totalMs) }}</span>
             </div>
             <div v-else class="turn-prompt muted">
               <span class="t-dot"></span>
@@ -243,7 +241,7 @@
           <table>
             <caption>
               会话的全部工具与 Skill 执行记录；默认按用户指令分组、组内按时间正序，筛选时按时间倒序。一次加载
-              {{ PAGE }} 条。
+              {{ PAGE }} 条，可继续加载更早或全部。
             </caption>
             <thead>
               <tr>
@@ -299,12 +297,22 @@
             v-if="data?.hasMore"
             type="button"
             class="more"
-            :disabled="loadingMore"
+            :disabled="loadingMore || loadingAll"
             @click="load({ more: true })"
           >
-            {{ loadingMore ? '加载中…' : '加载更早的记录' }}
+            {{ loadingMore && !loadingAll ? '加载中…' : '加载更早的记录' }}
           </button>
-          <span v-else class="muted">已到最早</span>
+          <button
+            v-if="data?.hasMore"
+            type="button"
+            class="more"
+            :disabled="loadingMore || loadingAll"
+            title="连续加载剩余的全部记录"
+            @click="loadAll"
+          >
+            {{ loadingAll ? `加载全部中… ${records.length} / ${totalForFooter}` : '加载全部' }}
+          </button>
+          <span v-if="!data?.hasMore" class="muted">已到最早</span>
           <span v-if="error" class="warn">{{ error }}</span>
         </footer>
       </template>
@@ -344,6 +352,7 @@ const data = ref(null);
 const records = ref([]);
 const loading = ref(true);
 const loadingMore = ref(false);
+const loadingAll = ref(false);
 const error = ref('');
 const filter = ref('all');
 const query = ref('');
@@ -358,6 +367,7 @@ const jumpKey = ref(null);
 let ctrl = null;
 let seq = 0;
 let disposed = false;
+let loadAllToken = 0;
 let searchTimer = null;
 
 const counts = computed(
@@ -379,6 +389,10 @@ const isFiltered = computed(
 );
 const statusCounts = computed(
   () => data.value?.status || { ok: 0, error: 0, pending: 0 }
+);
+/** 底栏进度分母：有筛选时用匹配数，否则用全量 */
+const totalForFooter = computed(() =>
+  isFiltered.value ? data.value?.matched ?? 0 : counts.value.total
 );
 
 /** 默认把用户指令当作分隔符，让每条工具调用都落在具体任务下面 */
@@ -425,13 +439,11 @@ function baseName(filePath) {
 
 function summarizeActions(actions) {
   if (!actions.length) {
-    return { description: '这段没有工具或 Skill 调用。', metrics: '0 个动作' };
+    return { description: '这段没有工具或 Skill 调用。', metricsParts: ['0 个动作'] };
   }
 
   let subagent = 0;
   let errors = 0;
-  let first = 0;
-  let last = 0;
 
   const modified = new Set();
   const read = new Set();
@@ -445,10 +457,6 @@ function summarizeActions(actions) {
     }
     if (action.name === 'Read' && action.summary) read.add(action.summary);
     toolCounts.set(action.name, (toolCounts.get(action.name) || 0) + 1);
-    if (action.ts) {
-      first = first ? Math.min(first, action.ts) : action.ts;
-      last = Math.max(last, action.ts);
-    }
   }
 
   const modifiedNames = [...new Set([...modified].map(baseName))];
@@ -495,14 +503,12 @@ function summarizeActions(actions) {
     .map(([name, count]) => `${name}×${count}`)
     .join(' · ');
 
-  const duration = first ? last - first : 0;
   return {
     description: did.length
       ? `这次主要做了：${did.join('；')}。`
       : '完成了一组工具调用，具体过程见下方时间线。',
-    metrics: [`${actions.length} 个动作`, duration ? fmtDuration(duration) : '', top]
-      .filter(Boolean)
-      .join(' · '),
+    // 耗时不在这里算：由 makeTurn 按「指令 → 最后一次动作完成」统一计算
+    metricsParts: [`${actions.length} 个动作`, top].filter(Boolean),
   };
 }
 
@@ -535,11 +541,27 @@ function makeTurn(prompt, actionsDesc) {
   const summary = summarizeActions(actions);
   const excerpt = prompt?.resultText ? resultExcerpt(prompt.resultText) : '';
   if (excerpt.length >= 4) summary.description = excerpt;
+
+  // 总耗时 = 用户指令 → 最后一次动作完成；没有指令时退回首个动作
+  let end = 0;
+  for (const action of actions) {
+    if (!action.ts) continue;
+    end = Math.max(end, action.ts + (action.durationMs || 0));
+  }
+  const start = prompt?.ts || actions[0]?.ts || 0;
+  const totalMs = start && end ? Math.max(0, end - start) : 0;
+
+  // 结果摘要里的耗时与指令行右侧的「总耗时」保持同一个口径
+  const metricsParts = summary.metricsParts.slice();
+  if (totalMs) metricsParts.splice(1, 0, fmtDuration(totalMs));
+  summary.metrics = metricsParts.join(' · ');
+
   return {
     key: prompt ? `prompt-${prompt.seq}` : `tail-${actionsDesc[0]?.seq ?? 'empty'}`,
     prompt,
     actions,
     summary,
+    totalMs,
   };
 }
 
@@ -741,6 +763,12 @@ async function load({ more = false } = {}) {
   if (disposed) return;
   if (more && !data.value?.hasMore) return;
 
+  // 重新加载（刷新 / 切换筛选 / 搜索）时中止正在进行的「加载全部」循环
+  if (!more) {
+    loadAllToken++;
+    loadingAll.value = false;
+  }
+
   const mySeq = ++seq;
   ctrl?.abort();
   ctrl = new AbortController();
@@ -792,6 +820,25 @@ async function load({ more = false } = {}) {
       if (!more) loading.value = false;
       loadingMore.value = false;
     }
+  }
+}
+
+/** 连续翻页直到取完；每页仍走 load()，保持与单次「加载更早」相同的合并与筛选逻辑 */
+async function loadAll() {
+  if (disposed || loading.value || loadingAll.value) return;
+  if (!data.value?.hasMore) return;
+
+  const token = ++loadAllToken;
+  loadingAll.value = true;
+  error.value = '';
+
+  try {
+    while (!disposed && token === loadAllToken && data.value?.hasMore) {
+      await load({ more: true });
+      if (error.value) break;
+    }
+  } finally {
+    if (token === loadAllToken) loadingAll.value = false;
   }
 }
 
@@ -1351,6 +1398,21 @@ function axisTimeLabel(ts, span) {
   background: rgba(94, 234, 212, 0.05);
 }
 
+/* 给右上角的「总耗时」预留固定宽度，避免长指令换行后与它重叠 */
+.turn-prompt.timed {
+  padding-right: 102px;
+}
+
+.t-duration {
+  position: absolute;
+  top: 7px;
+  right: 10px;
+  font-size: 10px;
+  color: var(--text-3);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
 .turn.latest .turn-prompt {
   background: rgba(94, 234, 212, 0.075);
   border-color: rgba(94, 234, 212, 0.28);
@@ -1574,27 +1636,6 @@ function axisTimeLabel(ts, span) {
   border-bottom: 1px solid var(--line);
 }
 
-.ratio-bar {
-  display: flex;
-  height: 6px;
-  margin-bottom: 7px;
-  border-radius: 99px;
-  overflow: hidden;
-  background: rgba(148, 163, 184, 0.12);
-}
-
-.ratio-bar .ok {
-  background: #34d399;
-}
-
-.ratio-bar .bad {
-  background: #f87171;
-}
-
-.ratio-bar .pending {
-  background: #fbbf24;
-}
-
 .ratio-text {
   display: flex;
   align-items: center;
@@ -1630,6 +1671,8 @@ function axisTimeLabel(ts, span) {
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+  padding-top: 8px;
+  border-top: 1px solid rgba(148, 163, 184, 0.2);
   font-size: 10.5px;
 }
 
