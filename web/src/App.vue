@@ -4,8 +4,8 @@
       <div class="brand">
         <div class="logo">◎</div>
         <div>
-          <h1>Skill Observatory</h1>
-          <p>Claude Code 技能可观测层 · 实时转录 tail</p>
+          <h1>观星台 <span class="brand-en">Observatory</span></h1>
+          <p>Claude Code 行为观测台 · 实时转录 tail</p>
         </div>
       </div>
 
@@ -233,6 +233,15 @@ h1 {
 .brand p {
   margin: 2px 0 0;
   font-size: 11px;
+  color: var(--text-3);
+}
+
+.brand-en {
+  margin-left: 5px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
   color: var(--text-3);
 }
 

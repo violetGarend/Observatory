@@ -1,6 +1,6 @@
-# Skill Observatory
+# 观星台 Observatory
 
-Claude Code 技能的**可观测层**：实时 tail 会话转录，回答「哪个 skill 被触发了、谁触发的、从哪个项目、花了多少上下文」。
+Claude Code 的**行为观测台**：实时 tail 会话转录，回答「哪个 skill 被触发了、谁触发的、从哪个项目、花了多少上下文」，并把会话执行记录与项目历史展开成可读的时间线。
 
 对应调研文档中「痛点四：为什么自动触发了 / 该触发的没触发」。不依赖 OTEL，不修改任何 Claude Code 配置。
 

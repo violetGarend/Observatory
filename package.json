@@ -1,9 +1,9 @@
 {
-  "name": "skill-observatory",
+  "name": "guanxingtai",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "可观测层：实时追踪 Claude Code 的 skill 触发、来源与上下文成本",
+  "description": "Claude Code 行为观测台：实时追踪 skill 触发、会话执行、MCP 与项目历史",
   "scripts": {
     "dev": "concurrently -n server,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:web\"",
     "dev:server": "node --watch server/index.js",

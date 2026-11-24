@@ -221,7 +221,7 @@ console.log(
 
 server.listen(PORT, '127.0.0.1', () => {
   const s = store.snapshot();
-  console.log(`\n  Skill Observatory 已启动`);
+  console.log(`\n  观星台 Observatory 已启动`);
   console.log(`  → http://127.0.0.1:${PORT}`);
   console.log(`  数据源: ${PROJECTS_DIR}`);
   console.log(
