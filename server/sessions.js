@@ -170,6 +170,7 @@ async function parseFile(entry, state) {
   }
 
   const local = new Map();
+  let activePrompt = null;
   let lineNo = 0;
   const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
 
@@ -180,7 +181,9 @@ async function parseFile(entry, state) {
         !line.includes('tool_use') &&
         !line.includes('tool_result') &&
         !line.includes('"type":"user"') &&
-        !line.includes('"type": "user"')
+        !line.includes('"type": "user"') &&
+        !line.includes('"type":"text"') &&
+        !line.includes('"type": "text"')
       ) {
         continue;
       }
@@ -198,6 +201,20 @@ async function parseFile(entry, state) {
       const sidechain = !!d.isSidechain;
 
       if (d.type === 'assistant') {
+        let assistantText = '';
+        if (typeof msg.content === 'string') {
+          assistantText = msg.content;
+        } else if (Array.isArray(msg.content)) {
+          assistantText = msg.content
+            .filter((block) => block && block.type === 'text')
+            .map((block) => block.text || '')
+            .join('\n');
+        }
+        if (assistantText.trim() && activePrompt) {
+          // 同一回合可能有多条助手文本，最后一条即本段最终答复
+          activePrompt.resultText = assistantText.replace(/\r/g, '').trim().slice(0, 1600);
+        }
+
         if (!Array.isArray(msg.content)) continue;
         for (let i = 0; i < msg.content.length; i++) {
           const block = msg.content[i];
@@ -227,7 +244,7 @@ async function parseFile(entry, state) {
         if (entry.source === 'main') {
           const prompt = extractPrompt(d);
           if (prompt) {
-            state.records.push({
+            const record = {
               order: state.order++,
               ts: tsMs,
               kind: 'prompt',
@@ -238,10 +255,13 @@ async function parseFile(entry, state) {
               status: 'ok',
               durationMs: null,
               result: '',
+              resultText: '',
               source: 'main',
               agent: 'main',
               sidechain,
-            });
+            };
+            state.records.push(record);
+            activePrompt = record;
           }
         }
 

@@ -39,7 +39,7 @@
 
       <div v-if="latestTurn && !isFiltered" class="latest-result">
         <span class="lr-label">本次指令结果</span>
-        <span class="lr-text">{{ latestTurn.summary.sentence }}</span>
+        <span class="lr-text">{{ latestTurn.summary.description }}</span>
         <span v-if="session && session.status !== 'idle'" class="lr-live">进行中</span>
         <span class="lr-meta">{{ latestTurn.summary.metrics }}</span>
       </div>
@@ -163,7 +163,7 @@
 
             <div class="turn-summary">
               <span class="ts-label">本段结果</span>
-              <span class="ts-text">{{ group.summary.sentence }}</span>
+              <span class="ts-text">{{ group.summary.description }}</span>
               <span class="ts-metrics">{{ group.summary.metrics }}</span>
             </div>
           </section>
@@ -333,17 +333,18 @@ const displayRows = computed(() => {
   return rows;
 });
 
+function baseName(filePath) {
+  const parts = String(filePath || '').replace(/\\/g, '/').split('/');
+  return parts[parts.length - 1] || String(filePath || '');
+}
+
 function summarizeActions(actions) {
   if (!actions.length) {
-    return { sentence: '这段没有工具或 Skill 调用。', metrics: '0 个动作' };
+    return { description: '这段没有工具或 Skill 调用。', metrics: '0 个动作' };
   }
 
-  let tool = 0;
-  let skill = 0;
-  let mcp = 0;
   let subagent = 0;
   let errors = 0;
-  let pending = 0;
   let first = 0;
   let last = 0;
 
@@ -353,12 +354,7 @@ function summarizeActions(actions) {
 
   for (const action of actions) {
     if (action.source === 'subagent') subagent++;
-    else if (action.kind === 'skill') skill++;
-    else if (action.kind === 'mcp') mcp++;
-    else tool++;
-
     if (action.status === 'error') errors++;
-    if (action.status === 'pending') pending++;
     if (['Edit', 'Write', 'MultiEdit'].includes(action.name) && action.summary) {
       modified.add(action.summary);
     }
@@ -370,16 +366,43 @@ function summarizeActions(actions) {
     }
   }
 
-  const parts = [];
-  if (modified.size) parts.push(`修改 ${modified.size} 个文件`);
-  if (read.size) parts.push(`读取 ${read.size} 个文件`);
-  if (tool) parts.push(`${tool} 次工具调用`);
-  if (skill) parts.push(`${skill} 次 Skill`);
-  if (mcp) parts.push(`${mcp} 次 MCP`);
-  if (subagent) parts.push(`${subagent} 次子代理动作`);
-  if (errors) parts.push(`${errors} 次失败`);
-  else if (pending) parts.push(`${pending} 个未返回`);
-  else parts.push('无失败');
+  const modifiedNames = [...new Set([...modified].map(baseName))];
+  const readNames = [...new Set([...read].map(baseName))];
+  const commands = actions
+    .filter((action) => action.name === 'Bash' && action.summary)
+    .map((action) => action.summary);
+  const skillNames = [...new Set(actions.filter((a) => a.kind === 'skill').map((a) => a.name))];
+  const usedBrowser = actions.some((a) => a.server === 'chrome-devtools');
+
+  const did = [];
+  if (modifiedNames.length) {
+    did.push(
+      `修改了 ${modifiedNames.slice(0, 3).join('、')}${modifiedNames.length > 3 ? ' 等文件' : ''}`
+    );
+  }
+  if (readNames.length && !modifiedNames.length) {
+    did.push(`阅读了 ${readNames.slice(0, 3).join('、')}${readNames.length > 3 ? ' 等文件' : ''}`);
+  }
+
+  const built = commands.some((c) => /build|构建/i.test(c));
+  const tested = commands.some((c) => /test|测试/i.test(c));
+  const started = commands.some((c) => /npm start|node server|server.*start|start.*server|启动服务/i.test(c));
+  const checkedApi = commands.some((c) => /curl|接口|health|\bapi\b/i.test(c));
+  const git = commands.some((c) => /\bgit\b/i.test(c));
+
+  if (built) did.push('构建了前端');
+  if (tested) did.push('运行了测试');
+  if (started) did.push('启动/检查了本地服务');
+  if (checkedApi) did.push('验证了接口');
+  if (git) did.push('查看了 Git 状态');
+  if (commands.length && !built && !tested && !started && !checkedApi && !git) {
+    did.push(`执行了命令「${commands[0].slice(0, 40)}」`);
+  }
+
+  if (usedBrowser) did.push('在浏览器中检查/操作了页面');
+  if (skillNames.length) did.push(`调用了 Skill：${skillNames.slice(0, 2).join('、')}`);
+  if (subagent) did.push('派发了子代理任务');
+  if (errors) did.push(`其中有 ${errors} 次调用失败`);
 
   const top = [...toolCounts.entries()]
     .sort((a, b) => b[1] - a[1])
@@ -389,20 +412,49 @@ function summarizeActions(actions) {
 
   const duration = first ? last - first : 0;
   return {
-    sentence: `结果：${parts.join('、')}。`,
+    description: did.length
+      ? `这次主要做了：${did.join('；')}。`
+      : '完成了一组工具调用，具体过程见下方时间线。',
     metrics: [`${actions.length} 个动作`, duration ? fmtDuration(duration) : '', top]
       .filter(Boolean)
       .join(' · '),
   };
 }
 
+function resultExcerpt(text, limit = 200) {
+  const cleaned = String(text || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/\r/g, '');
+
+  const lines = cleaned
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  // 取第一段非标题/列表/引用/表格的正文，最终答复的第一段通常是结果概述
+  let first =
+    lines.find((line) => !/^(#{1,6}\s|>|\||[-*+]\s|\d+\.\s)/.test(line)) || lines[0] || '';
+
+  first = first
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*(.*?)\*\*/g, '$1')
+    .replace(/^\s*[-*+]\s+/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return first.length > limit ? `${first.slice(0, limit - 1)}…` : first;
+}
+
 function makeTurn(prompt, actionsDesc) {
   const actions = actionsDesc.slice().reverse(); // records 是新→旧，回合内按时间正序
+  const summary = summarizeActions(actions);
+  const excerpt = prompt?.resultText ? resultExcerpt(prompt.resultText) : '';
+  if (excerpt.length >= 4) summary.description = excerpt;
   return {
     key: prompt ? `prompt-${prompt.seq}` : `tail-${actionsDesc[0]?.seq ?? 'empty'}`,
     prompt,
     actions,
-    summary: summarizeActions(actions),
+    summary,
   };
 }
 
